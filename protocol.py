@@ -1,3 +1,4 @@
+import struct
 from dataclasses import dataclass
 
 ETHERTYPE_IPV4 = 0x0800
@@ -10,7 +11,7 @@ DEFAULT_TTL = 100
 @dataclass
 class Frame:
     """
-    Layer 2 (Ethernet-like) frame.
+    Layer 2 frame.
 
     Attributes
     ----------
@@ -38,7 +39,12 @@ class Frame:
             Concatenation of dst_mac (6) + src_mac (6) +
             ethertype (2) + payload.
         """
-        pass
+        return (
+            self._mac_to_bytes(self.dst_mac)
+            + self._mac_to_bytes(self.src_mac)
+            + struct.pack(">H", self.ethertype)
+            + self.payload
+        )
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "Frame":
@@ -55,13 +61,52 @@ class Frame:
         Frame
             A new instance with payload set to the remaining bytes.
         """
-        pass
+        dst_mac = cls._bytes_to_mac(raw[0:6])
+        src_mac = cls._bytes_to_mac(raw[6:12])
+        (ethertype,) = struct.unpack(">H", raw[12:14])
+        payload = raw[14:]
+        return cls(dst_mac, src_mac, ethertype, payload)
+
+    @staticmethod
+    def _mac_to_bytes(mac: str) -> bytes:
+        """
+        Convert a MAC string to 6 raw bytes.
+
+        Parameters
+        ----------
+        mac : str
+            MAC address in XX:XX:XX:XX:XX:XX form.
+
+        Returns
+        -------
+        bytes
+            Six byte representation.
+        """
+        return bytes.fromhex(mac.replace(":", ""))
+
+    @staticmethod
+    def _bytes_to_mac(raw: bytes) -> str:
+        """
+        Convert 6 raw bytes to a colon separated uppercase MAC string.
+
+        Parameters
+        ----------
+        raw : bytes
+            Six byte buffer.
+
+        Returns
+        -------
+        str
+            MAC address in XX:XX:XX:XX:XX:XX form.
+        """
+        return ":".join(f"{b:02X}" for b in raw)
+
 
 
 @dataclass
 class Packet:
     """
-    Layer 3 (IP-like) packet.
+    Layer 3 packet.
 
     Attributes
     ----------
@@ -73,7 +118,7 @@ class Packet:
         Time to live. Decremented at each router the packet is
         dropped when TTL reaches zero.
     proto : int
-        Upper layer protocol identifier (1 byte). PROTO_UDP 
+        Upper layer protocol identifier (1 byte). PROTO_UDP
         signals a UDP like segment payload.
     total_length : int
         Header (12 bytes) + payload size (2 bytes).
@@ -97,7 +142,12 @@ class Packet:
             src_ip (4) + dst_ip (4) + ttl (1) + proto (1)
             + total_length (2) + payload
         """
-        pass
+        return (
+            self._ip_to_bytes(self.src_ip)
+            + self._ip_to_bytes(self.dst_ip)
+            + struct.pack(">BBH", self.ttl, self.proto, self.total_length)
+            + self.payload
+        )
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "Packet":
@@ -114,8 +164,45 @@ class Packet:
         Packet
             A new instance with payload set to the remaining bytes.
         """
-        pass
+        src_ip = cls._bytes_to_ip(raw[0:4])
+        dst_ip = cls._bytes_to_ip(raw[4:8])
+        ttl, proto, total_length = struct.unpack(">BBH", raw[8:12])
+        payload = raw[12:]
+        return cls(src_ip, dst_ip, ttl, proto, total_length, payload)
 
+    @staticmethod
+    def _ip_to_bytes(ip: str) -> bytes:
+        """
+        Convert a dotted-quad IPv4 string to 4 raw bytes.
+
+        Parameters
+        ----------
+        ip : str
+            IPv4 address in dotted form.
+
+        Returns
+        -------
+        bytes
+            Four byte representation.
+        """
+        return bytes(int(octet) for octet in ip.split("."))
+
+    @staticmethod
+    def _bytes_to_ip(raw: bytes) -> str:
+        """
+        Convert 4 raw bytes to a dotted IPv4 string.
+
+        Parameters
+        ----------
+        raw : bytes
+            Four byte buffer.
+
+        Returns
+        -------
+        str
+            IPv4 address in dotted form.
+        """
+        return ".".join(str(b) for b in raw)
 
 @dataclass
 class Segment:
@@ -150,16 +237,14 @@ class Segment:
         """
         Compute the 16 bit ones complement checksum over the segment.
 
-        The checksum field itself is treated as zero while the value is
-        being computed, the result is then stored back into the checksum
-        attribute.
-
         Returns
         -------
         int
             The newly computed 16 bit checksum.
         """
-        pass
+        self.checksum = 0
+        self.checksum = self._checksum(self.to_bytes())
+        return self.checksum
 
     def verify(self) -> bool:
         """
@@ -170,7 +255,7 @@ class Segment:
         bool
             True if the segment is intact, False if corrupted.
         """
-        pass
+        return self._checksum(self.to_bytes()) == 0
 
     def to_bytes(self) -> bytes:
         """Serialise the segment to its byte representation.
@@ -181,7 +266,15 @@ class Segment:
             src_port (2) + dst_port (2) + length (2) +
             checksum (2) + type (1) + seq (1) + data.
         """
-        pass
+        return (
+            struct.pack(
+                ">HHHHBB",
+                self.src_port, self.dst_port,
+                self.length, self.checksum,
+                self.type, self.seq,
+            )
+            + self.data
+        )
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "Segment":
@@ -198,4 +291,31 @@ class Segment:
         Segment
             A new instance with data set to the remaining bytes.
         """
-        pass
+        (src_port, dst_port, length, checksum,
+         type_, seq) = struct.unpack(">HHHHBB", raw[0:10])
+        data = raw[10:]
+        return cls(src_port, dst_port, length, checksum, type_, seq, data)
+
+    @staticmethod
+    def _checksum(data: bytes) -> int:
+        """
+        Compute the ones complement checksum.
+
+        Parameters
+        ----------
+        data : bytes
+            Byte buffer to checksum.
+
+        Returns
+        -------
+        int
+            16 bit checksum value.
+        """
+        if len(data) % 2:
+            data += b"\x00"
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) | data[i + 1]
+        while total >> 16:
+            total = (total & 0xFFFF) + (total >> 16)
+        return (~total) & 0xFFFF
