@@ -7,7 +7,9 @@ Data flow on send:
               -> (router) L2.send_down  /  (host) L4.receive
 """
 
-from protocol import Frame, Segment, Packet
+from protocol import (Frame, Segment, Packet,
+                       ETHERTYPE_IPV4, PROTO_UDP,
+                       TYPE_DATA, TYPE_ACK, DEFAULT_TTL)
 
 
 MAX_DATA: int = 500 # Maximum application data bytes per Layer 4 segment
@@ -45,10 +47,10 @@ class Interface:
         self.name = name
         self.ip = ip
         self.mac = mac
-        self.link: Link | None = None
+        self.link: "Link | None" = None
         self.datalink: DataLinkLayer | None = None
 
-    def attach(self, link: Link) -> None:
+    def attach(self, link: "Link") -> None:
         """
         Bind this interface to a link.
 
@@ -57,7 +59,7 @@ class Interface:
         link : Link
             The link object connecting this interface to a peer.
         """
-        pass
+        self.link = link
 
     def transmit(self, frame: Frame) -> None:
         """
@@ -72,7 +74,7 @@ class Interface:
         -----
         Convenience wrapper around self.link.transmit(frame, self).
         """
-        pass
+        self.link.transmit(frame, self)
 
 
 class Link:
@@ -105,7 +107,8 @@ class Link:
         from_iface : Interface
             The sending interface; used to locate the peer endpoint.
         """
-        pass
+        peer = self.b if from_iface is self.a else self.a
+        peer.datalink.receive(frame, peer)
 
 
 class DataLinkLayer:
@@ -148,7 +151,7 @@ class DataLinkLayer:
         """
         Encapsulate a packet in a frame and transmit it.
 
-        Called by NetworkLayer. Logs frame creation and the transmission event 
+        Called by NetworkLayer. Logs frame creation and the transmission event
         then calls iface.transmit(frame).
 
         Parameters
@@ -162,7 +165,10 @@ class DataLinkLayer:
             Outgoing interface chosen by L3.
 
         """
-        pass
+        dst_mac = self._lookup_mac(next_hop_ip)
+        frame = Frame(dst_mac, iface.mac, ETHERTYPE_IPV4, packet.to_bytes())
+        print(f"[{self.device_name}] L2: frame {iface.mac} -> {dst_mac} on {iface.name}")
+        iface.transmit(frame)
 
     def receive(self, frame: Frame, iface: Interface) -> None:
         """
@@ -175,7 +181,11 @@ class DataLinkLayer:
         iface : Interface
             The interface the frame arrived on.
         """
-        pass
+        self._learn(frame.src_mac, iface)
+        if frame.ethertype != ETHERTYPE_IPV4:
+            return
+        packet = Packet.from_bytes(frame.payload)
+        self.network.receive(packet, iface)
 
     def _lookup_mac(self, next_hop_ip: str) -> str:
         """
@@ -190,7 +200,7 @@ class DataLinkLayer:
         str
             MAC address from arp_table.
         """
-        pass
+        return self.arp_table[next_hop_ip]
 
     def _learn(self, src_mac: str, iface: Interface) -> None:
         """
@@ -202,7 +212,9 @@ class DataLinkLayer:
         iface : Interface
             The interface the MAC was observed on.
         """
-        pass
+        if src_mac not in self.learned:
+            self.learned[src_mac] = (iface.name,)
+            print(f"[{self.device_name}] L2: learned {src_mac} on {iface.name}")
 
 
 RouteEntry = tuple[str, int, str | None, str]
@@ -270,7 +282,12 @@ class NetworkLayer:
         ttl=DEFAULT_TTL (host) or the existing TTL (if router forward),
         and calls self.datalink.send_down(packet, next_hop, iface).
         """
-        pass
+        seg_bytes = segment.to_bytes()
+        packet = Packet(src_ip, dst_ip, DEFAULT_TTL, PROTO_UDP,
+                        12 + len(seg_bytes), seg_bytes)
+        print(f"[{self.device_name}] L3: packet {src_ip} -> {dst_ip} TTL={DEFAULT_TTL}")
+        iface, next_hop = self._route(dst_ip)
+        self.datalink.send_down(packet, next_hop, iface)
 
     def receive(self, packet: Packet, iface: Interface) -> None:
         """
@@ -283,7 +300,21 @@ class NetworkLayer:
         iface : Interface
             Interface the underlying frame arrived on.
         """
-        pass
+        if self.is_router:
+            packet.ttl -= 1
+            if packet.ttl <= 0:
+                print(f"[{self.device_name}] L3: TTL expired, dropping {packet.src_ip} -> {packet.dst_ip}")
+                return
+            fwd_iface, next_hop = self._route(packet.dst_ip)
+            print(f"[{self.device_name}] L3: forwarding {packet.src_ip} -> {packet.dst_ip} TTL={packet.ttl} via {fwd_iface.name}")
+            self.datalink.send_down(packet, next_hop, fwd_iface)
+        else:
+            if not self._is_local(packet.dst_ip):
+                print(f"[{self.device_name}] L3: dropping packet not addressed to us ({packet.dst_ip})")
+                return
+            print(f"[{self.device_name}] L3: delivering {packet.src_ip} -> {packet.dst_ip}")
+            segment = Segment.from_bytes(packet.payload)
+            self.transport.receive(segment, packet.src_ip, packet.dst_ip)
 
     def _route(self, dst_ip: str) -> tuple[Interface, str]:
         """
@@ -299,7 +330,18 @@ class NetworkLayer:
             The chosen outgoing interface and the next hop IP. For a
             directly connected destination the next hop is dst_ip.
         """
-        pass
+        dst_int = int.from_bytes(bytes(int(x) for x in dst_ip.split(".")), "big")
+        best_prefix = -1
+        best_iface: Interface | None = None
+        best_next_hop: str | None = None
+        for network, prefix, next_hop, iface_name in self.routing_table:
+            net_int = int.from_bytes(bytes(int(x) for x in network.split(".")), "big")
+            mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix > 0 else 0
+            if (dst_int & mask) == (net_int & mask) and prefix > best_prefix:
+                best_prefix = prefix
+                best_iface = next((i for i in self.interfaces if i.name == iface_name), None)
+                best_next_hop = next_hop if next_hop is not None else dst_ip
+        return best_iface, best_next_hop
 
     def _is_local(self, dst_ip: str) -> bool:
         """
@@ -314,7 +356,7 @@ class NetworkLayer:
         bool
             True if the packet should be delivered locally.
         """
-        pass
+        return any(iface.ip == dst_ip for iface in self.interfaces)
 
 
 class TransportLayer:
@@ -379,7 +421,22 @@ class TransportLayer:
         expected value: if matched, flips the sequence number and
         proceeds otherwise retransmits.
         """
-        pass
+        seq = 0
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + MAX_DATA]
+            seg = Segment(src_port, dst_port, 10 + len(chunk), 0, TYPE_DATA, seq, chunk)
+            seg.compute_checksum()
+            while True:
+                self._awaiting_ack = seq
+                print(f"[{self.device_name}] L4: sending DATA seq={seq} ({len(chunk)} bytes)")
+                self.network.send_down(seg, src_ip, dst_ip)
+                if self._last_ack_seq == seq:
+                    break
+                print(f"[{self.device_name}] L4: retransmitting seq={seq}")
+            seq ^= 1
+            offset += MAX_DATA
+        self._awaiting_ack = None
 
     def receive(self, segment: Segment, src_ip: str, dst_ip: str) -> None:
         """
@@ -396,7 +453,26 @@ class TransportLayer:
             Destination IP from the enclosing packet header (used as
             the ACK source).
         """
-        pass
+        if segment.type == TYPE_ACK:
+            if segment.verify() and segment.seq == self._awaiting_ack:
+                self._last_ack_seq = segment.seq
+                print(f"[{self.device_name}] L4: received ACK seq={segment.seq}")
+            else:
+                print(f"[{self.device_name}] L4: received bad/unexpected ACK seq={segment.seq}, ignoring")
+            return
+
+        if not segment.verify() or segment.seq != self._expected_seq:
+            print(f"[{self.device_name}] L4: corrupt/duplicate DATA seq={segment.seq}, re-ACKing {self._last_ack_sent}")
+            if self._last_ack_sent is not None:
+                self._send_ack(self._last_ack_sent, dst_ip, src_ip,
+                               segment.dst_port, segment.src_port)
+            return
+
+        self._deliver(segment.data)
+        self._last_ack_sent = segment.seq
+        self._expected_seq ^= 1
+        print(f"[{self.device_name}] L4: ACKing seq={segment.seq}")
+        self._send_ack(segment.seq, dst_ip, src_ip, segment.dst_port, segment.src_port)
 
     def _send_ack(self, seq: int, src_ip: str, dst_ip: str, src_port: int, dst_port: int) -> None:
         """
@@ -413,7 +489,9 @@ class TransportLayer:
         src_port, dst_port : int
             Ports for the ACK mirror the original segment.
         """
-        pass
+        ack = Segment(src_port, dst_port, 10, 0, TYPE_ACK, seq, b"")
+        ack.compute_checksum()
+        self.network.send_down(ack, src_ip, dst_ip)
 
     def _deliver(self, data: bytes) -> None:
         """
@@ -424,7 +502,9 @@ class TransportLayer:
         data : bytes
             Payload extracted from a valid DATA segment.
         """
-        pass
+        preview = data[:40]
+        tail = "..." if len(data) > 40 else ""
+        print(f"[{self.device_name}] APP: received {len(data)} bytes: {preview!r}{tail}")
 
 
 class Host:
@@ -479,7 +559,7 @@ class Host:
         src_port : int, optional
             Source port to use, by default 5000.
         """
-        pass
+        self.transport.send(data, self.interface.ip, dst_ip, src_port, dst_port)
 
 
 class Router:
