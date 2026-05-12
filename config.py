@@ -56,6 +56,5 @@ ROUTING_TABLE_HOST_B: list[tuple[str, int, str | None, str]] = [
     ("0.0.0.0", 0, R1_IF2_IP, HOST_B_IFACE_NAME), # default
 ]
 
-# Application port defaults
 APP_SRC_PORT = 5000
 APP_DST_PORT = 80

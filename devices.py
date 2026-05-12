@@ -7,6 +7,8 @@ Data flow on send:
               -> (router) L2.send_down  /  (host) L4.receive
 """
 
+from __future__ import annotations
+
 from protocol import (Frame, Segment, Packet,
                        ETHERTYPE_IPV4, PROTO_UDP,
                        TYPE_DATA, TYPE_ACK, DEFAULT_TTL)
@@ -47,10 +49,10 @@ class Interface:
         self.name = name
         self.ip = ip
         self.mac = mac
-        self.link: "Link | None" = None
+        self.link: Link | None = None
         self.datalink: DataLinkLayer | None = None
 
-    def attach(self, link: "Link") -> None:
+    def attach(self, link: Link) -> None:
         """
         Bind this interface to a link.
 
@@ -143,7 +145,7 @@ class DataLinkLayer:
         self.device_name = device_name
         self.interfaces = interfaces
         self.arp_table = arp_table
-        self.network: "NetworkLayer | None" = None
+        self.network: NetworkLayer | None = None
         self.learned: dict[str, tuple[str, str]] = {}
 
     def send_down(self, packet: Packet, next_hop_ip: str,
@@ -258,8 +260,8 @@ class NetworkLayer:
         self.interfaces = interfaces
         self.routing_table = routing_table
         self.is_router = is_router
-        self.transport: "TransportLayer | None" = None
-        self.datalink: "DataLinkLayer | None" = None
+        self.transport: TransportLayer | None = None
+        self.datalink: DataLinkLayer | None = None
 
     def send_down(self, segment: Segment, src_ip: str, dst_ip: str) -> None:
         """
@@ -332,8 +334,8 @@ class NetworkLayer:
         """
         dst_int = int.from_bytes(bytes(int(x) for x in dst_ip.split(".")), "big")
         best_prefix = -1
-        best_iface: Interface | None = None
-        best_next_hop: str | None = None
+        best_iface = None
+        best_next_hop = None
         for network, prefix, next_hop, iface_name in self.routing_table:
             net_int = int.from_bytes(bytes(int(x) for x in network.split(".")), "big")
             mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix > 0 else 0
@@ -363,7 +365,7 @@ class TransportLayer:
     """
     Layer 4: ports, checksum, rdt2.2.
 
-    Because the simulation runs synchronously, the senders
+    Because the simulation runs synchronously the senders
     send blocks while network.send_down propagates all the
     way to the receiver and the ACK propagates back through
     receive. On return, sender state has been updated.
