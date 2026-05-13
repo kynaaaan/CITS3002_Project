@@ -1,20 +1,10 @@
-"""
-Data flow on send:
 
-    app_send -> L4.send -> L3.send_down -> L2.send_down
-              -> Interface.transmit -> Link.transmit
-              -> peer L2.receive -> peer L3.receive
-              -> (router) L2.send_down  /  (host) L4.receive
-"""
-
-from __future__ import annotations
+from typing import Dict, List, Optional, Tuple
 
 from protocol import (Frame, Segment, Packet,
                        ETHERTYPE_IPV4, PROTO_UDP,
                        TYPE_DATA, TYPE_ACK, DEFAULT_TTL)
-
-
-MAX_DATA: int = 500 # Maximum application data bytes per Layer 4 segment
+from config import MAX_DATA
 
 
 class Interface:
@@ -49,10 +39,10 @@ class Interface:
         self.name = name
         self.ip = ip
         self.mac = mac
-        self.link: Link | None = None
-        self.datalink: DataLinkLayer | None = None
+        self.link: Optional[Link] = None
+        self.datalink: Optional[DataLinkLayer] = None
 
-    def attach(self, link: Link) -> None:
+    def attach(self, link) -> None:
         """
         Bind this interface to a link.
 
@@ -127,29 +117,32 @@ class DataLinkLayer:
     arp_table : dict of str to str
         Static map next_hop_ip: mac used to resolve outgoing
         Layer 2 destination addresses.
+    is_router : bool
+        True for routers; affects log wording on receive / forward.
 
     Attributes
     ----------
     device_name : str
     interfaces : list of Interface
     arp_table : dict of str to str
+    is_router : bool
     network : NetworkLayer or None
         Back reference to the owning devices L3 set by the device.
-    learned : dict of str to tuple of (str, str)
-        MAC learning table populated on receive: src_mac:
-        (iface_name, ...)}.
+    learned : dict of str to tuple of (str,)
+        MAC learning table populated on receive: src_mac to
+        (iface_name,).
     """
 
-    def __init__(self, device_name: str, interfaces: list[Interface],
-                 arp_table: dict[str, str]):
+    def __init__(self, device_name: str, interfaces: List[Interface],
+                 arp_table: Dict[str, str], is_router: bool = False):
         self.device_name = device_name
         self.interfaces = interfaces
         self.arp_table = arp_table
-        self.network: NetworkLayer | None = None
-        self.learned: dict[str, tuple[str, str]] = {}
+        self.is_router = is_router
+        self.network: Optional[NetworkLayer] = None
+        self.learned: Dict[str, Tuple[str, ...]] = {}
 
-    def send_down(self, packet: Packet, next_hop_ip: str,
-                  iface: Interface) -> None:
+    def send_down(self, packet: Packet, next_hop_ip: str, iface: Interface) -> None:
         """
         Encapsulate a packet in a frame and transmit it.
 
@@ -167,9 +160,14 @@ class DataLinkLayer:
             Outgoing interface chosen by L3.
 
         """
+        print(f"{self.device_name}: Layer 2: Packet received from Network Layer")
         dst_mac = self._lookup_mac(next_hop_ip)
         frame = Frame(dst_mac, iface.mac, ETHERTYPE_IPV4, packet.to_bytes())
-        print(f"[{self.device_name}] L2: frame {iface.mac} -> {dst_mac} on {iface.name}")
+        print(f"{self.device_name}: Layer 2: Frame created: SRC_MAC={iface.mac}, DST_MAC={dst_mac}")
+        if self.is_router:
+            print(f"{self.device_name}: Layer 2: Frame forwarded on {iface.name}")
+        else:
+            print(f"{self.device_name}: Layer 2: Frame sent")
         iface.transmit(frame)
 
     def receive(self, frame: Frame, iface: Interface) -> None:
@@ -183,10 +181,15 @@ class DataLinkLayer:
         iface : Interface
             The interface the frame arrived on.
         """
+        if self.is_router:
+            print(f"{self.device_name}: Layer 2: Frame received on {iface.name}")
+        else:
+            print(f"{self.device_name}: Layer 2: Frame received")
         self._learn(frame.src_mac, iface)
         if frame.ethertype != ETHERTYPE_IPV4:
             return
         packet = Packet.from_bytes(frame.payload)
+        print(f"{self.device_name}: Layer 2: Packet delivered to Network Layer")
         self.network.receive(packet, iface)
 
     def _lookup_mac(self, next_hop_ip: str) -> str:
@@ -202,7 +205,9 @@ class DataLinkLayer:
         str
             MAC address from arp_table.
         """
-        return self.arp_table[next_hop_ip]
+        lookup = self.arp_table[next_hop_ip]
+        print(f"{self.device_name}: Layer 2: Destination MAC lookup for next-hop IP ({next_hop_ip}) → {lookup}")
+        return lookup
 
     def _learn(self, src_mac: str, iface: Interface) -> None:
         """
@@ -216,16 +221,10 @@ class DataLinkLayer:
         """
         if src_mac not in self.learned:
             self.learned[src_mac] = (iface.name,)
-            print(f"[{self.device_name}] L2: learned {src_mac} on {iface.name}")
-
-
-RouteEntry = tuple[str, int, str | None, str]
-"""
-tuple: A routing table entry of the form (network, prefix, next_hop_or_None, iface_name).
-
-next hop is None for directly connected routes, in that case the
-next hop is the destination IP itself.
-"""
+            if self.is_router:
+                print(f"{self.device_name}: Layer 2: Source MAC learned: {src_mac} on {iface.name}")
+            else:
+                print(f"{self.device_name}: Layer 2: Source MAC learned: {src_mac}")
 
 
 class NetworkLayer:
@@ -237,8 +236,11 @@ class NetworkLayer:
         Owning devices name, used as a log prefix.
     interfaces : list of Interface
         All interfaces this layer can route out of.
-    routing_table : list of RouteEntry
-        Longest prefix match routing table for this device.
+    routing_table : list of tuple
+        Routing table entries of the form
+        (network, prefix, next_hop_or_None, iface_name). next_hop is
+        None for directly connected routes; in that case the next hop
+        is the destination IP itself.
     is_router : bool
         True for the router (forwards on receive, decrements TTL);
         False for hosts (delivers locally on receive).
@@ -247,7 +249,7 @@ class NetworkLayer:
     ----------
     device_name : str
     interfaces : list of Interface
-    routing_table : list of RouteEntry
+    routing_table : list of tuple
     is_router : bool
     transport : TransportLayer or None
         Back reference to L4. None on a router.
@@ -255,13 +257,15 @@ class NetworkLayer:
         Back reference to L2.
     """
 
-    def __init__(self, device_name: str, interfaces: list[Interface], routing_table: list[RouteEntry], is_router: bool):
+    def __init__(self, device_name: str, interfaces: List[Interface],
+                 routing_table: List[Tuple[str, int, Optional[str], str]],
+                 is_router: bool):
         self.device_name = device_name
         self.interfaces = interfaces
         self.routing_table = routing_table
         self.is_router = is_router
-        self.transport: TransportLayer | None = None
-        self.datalink: DataLinkLayer | None = None
+        self.transport: Optional[TransportLayer] = None
+        self.datalink: Optional[DataLinkLayer] = None
 
     def send_down(self, segment: Segment, src_ip: str, dst_ip: str) -> None:
         """
@@ -278,17 +282,17 @@ class NetworkLayer:
 
         Notes
         -----
-        Called by TransportLayer on a host, and by
-        receive method on a router when forwarding. Performs a routing
-        lookup via _route, builds a Packet with
-        ttl=DEFAULT_TTL (host) or the existing TTL (if router forward),
-        and calls self.datalink.send_down(packet, next_hop, iface).
+        Called by TransportLayer on a host. Performs a routing lookup
+        via _route, builds a Packet with ttl=DEFAULT_TTL and calls
+        self.datalink.send_down(packet, next_hop, iface).
         """
+        print(f"{self.device_name}: Layer 3: Segment received from Transport Layer: SRC_IP={src_ip}, DST_IP={dst_ip}, TTL={DEFAULT_TTL}")
+        print(f"{self.device_name}: Layer 3: Destination IP read: {dst_ip}")
         seg_bytes = segment.to_bytes()
         packet = Packet(src_ip, dst_ip, DEFAULT_TTL, PROTO_UDP,
                         12 + len(seg_bytes), seg_bytes)
-        print(f"[{self.device_name}] L3: packet {src_ip} -> {dst_ip} TTL={DEFAULT_TTL}")
         iface, next_hop = self._route(dst_ip)
+        print(f"{self.device_name}: Layer 3: Packet forwarded to Data Link Layer")
         self.datalink.send_down(packet, next_hop, iface)
 
     def receive(self, packet: Packet, iface: Interface) -> None:
@@ -303,22 +307,28 @@ class NetworkLayer:
             Interface the underlying frame arrived on.
         """
         if self.is_router:
+            print(f"{self.device_name}: Layer 3: Packet received from Data Link Layer: SRC_IP={packet.src_ip}, DST_IP={packet.dst_ip}, TTL={packet.ttl}")
+            print(f"{self.device_name}: Layer 3: Destination IP read: {packet.dst_ip}")
+            old_ttl = packet.ttl
             packet.ttl -= 1
+            print(f"{self.device_name}: Layer 3: TTL decremented: {old_ttl} → {packet.ttl}")
             if packet.ttl <= 0:
-                print(f"[{self.device_name}] L3: TTL expired, dropping {packet.src_ip} -> {packet.dst_ip}")
+                print(f"{self.device_name}: Layer 3: TTL expired, packet dropped")
                 return
             fwd_iface, next_hop = self._route(packet.dst_ip)
-            print(f"[{self.device_name}] L3: forwarding {packet.src_ip} -> {packet.dst_ip} TTL={packet.ttl} via {fwd_iface.name}")
+            print(f"{self.device_name}: Layer 3: Packet forwarded to Data Link Layer")
             self.datalink.send_down(packet, next_hop, fwd_iface)
         else:
+            print(f"{self.device_name}: Layer 3: Packet received from Data Link Layer: SRC_IP={packet.src_ip}, DST_IP={packet.dst_ip}, TTL={packet.ttl}")
+            print(f"{self.device_name}: Layer 3: Destination IP read: {packet.dst_ip}")
             if not self._is_local(packet.dst_ip):
-                print(f"[{self.device_name}] L3: dropping packet not addressed to us ({packet.dst_ip})")
                 return
-            print(f"[{self.device_name}] L3: delivering {packet.src_ip} -> {packet.dst_ip}")
+            print(f"{self.device_name}: Layer 3: Packet identified as local delivery")
+            print(f"{self.device_name}: Layer 3: Segment delivered to Transport Layer")
             segment = Segment.from_bytes(packet.payload)
             self.transport.receive(segment, packet.src_ip, packet.dst_ip)
 
-    def _route(self, dst_ip: str) -> tuple[Interface, str]:
+    def _route(self, dst_ip: str) -> Tuple[Interface, str]:
         """
         Look up the outgoing interface and next hop IP for dst_ip.
 
@@ -343,6 +353,12 @@ class NetworkLayer:
                 best_prefix = prefix
                 best_iface = next((i for i in self.interfaces if i.name == iface_name), None)
                 best_next_hop = next_hop if next_hop is not None else dst_ip
+        print(f"{self.device_name}: Layer 3: Routing table lookup performed")
+        print(f"{self.device_name}: Layer 3: Next-hop IP determined: {best_next_hop}")
+        if self.is_router:
+            print(f"{self.device_name}: Layer 3: Outgoing interface selected ({best_iface.name})")
+        else:
+            print(f"{self.device_name}: Layer 3: Outgoing interface selected")
         return best_iface, best_next_hop
 
     def _is_local(self, dst_ip: str) -> bool:
@@ -392,13 +408,13 @@ class TransportLayer:
         duplicate or corrupt incoming DATA.
     """
 
-    def __init__(self, device_name: str, network: "NetworkLayer"):
+    def __init__(self, device_name: str, network: NetworkLayer):
         self.device_name = device_name
         self.network = network
-        self._awaiting_ack: int | None = None
-        self._last_ack_seq: int | None = None
+        self._awaiting_ack: Optional[int] = None
+        self._last_ack_seq: Optional[int] = None
         self._expected_seq: int = 0
-        self._last_ack_sent: int | None = None
+        self._last_ack_sent: Optional[int] = None
 
     def send(self, data: bytes, src_ip: str, dst_ip: str, src_port: int, dst_port: int) -> None:
         """
@@ -423,19 +439,23 @@ class TransportLayer:
         expected value: if matched, flips the sequence number and
         proceeds otherwise retransmits.
         """
+        print(f"{self.device_name}: Layer 4: Data received from Application Layer. Data size={len(data)}")
+
         seq = 0
         offset = 0
         while offset < len(data):
             chunk = data[offset:offset + MAX_DATA]
             seg = Segment(src_port, dst_port, 10 + len(chunk), 0, TYPE_DATA, seq, chunk)
             seg.compute_checksum()
+            print(f"{self.device_name}: Layer 4: Checksum computed")
+            print(f"{self.device_name}: Layer 4: Segment created by adding transport layer header (DATA, seq={seq}) (encapsulation)")
             while True:
                 self._awaiting_ack = seq
-                print(f"[{self.device_name}] L4: sending DATA seq={seq} ({len(chunk)} bytes)")
+                print(f"{self.device_name}: Layer 4: Segment sent to Network Layer")
                 self.network.send_down(seg, src_ip, dst_ip)
                 if self._last_ack_seq == seq:
                     break
-                print(f"[{self.device_name}] L4: retransmitting seq={seq}")
+                print(f"{self.device_name}: Layer 4: Segment retransmitted due to incorrect ACK (seq={seq})")
             seq ^= 1
             offset += MAX_DATA
         self._awaiting_ack = None
@@ -455,25 +475,32 @@ class TransportLayer:
             Destination IP from the enclosing packet header (used as
             the ACK source).
         """
-        if segment.type == TYPE_ACK:
-            if segment.verify() and segment.seq == self._awaiting_ack:
-                self._last_ack_seq = segment.seq
-                print(f"[{self.device_name}] L4: received ACK seq={segment.seq}")
-            else:
-                print(f"[{self.device_name}] L4: received bad/unexpected ACK seq={segment.seq}, ignoring")
+        print(f"{self.device_name}: Layer 4: Segment received from Network Layer")
+
+        if not segment.verify():
+            print(f"{self.device_name}: Layer 4: Segment discarded due to checksum error")
+            if segment.type == TYPE_DATA and self._last_ack_sent is not None:
+                self._send_ack(self._last_ack_sent, dst_ip, src_ip,
+                               segment.dst_port, segment.src_port)
             return
 
-        if not segment.verify() or segment.seq != self._expected_seq:
-            print(f"[{self.device_name}] L4: corrupt/duplicate DATA seq={segment.seq}, re-ACKing {self._last_ack_sent}")
+        print(f"{self.device_name}: Layer 4: Checksum verified")
+
+        if segment.type == TYPE_ACK:
+            if segment.seq == self._awaiting_ack:
+                self._last_ack_seq = segment.seq
+                print(f"{self.device_name}: Layer 4: ACK received: seq={segment.seq}")
+            return
+
+        if segment.seq != self._expected_seq:
             if self._last_ack_sent is not None:
                 self._send_ack(self._last_ack_sent, dst_ip, src_ip,
                                segment.dst_port, segment.src_port)
             return
 
-        self._deliver(segment.data)
+        print(f"{self.device_name}: Layer 4: DATA segment delivered to Application Layer. Data size={len(segment.data)}")
         self._last_ack_sent = segment.seq
         self._expected_seq ^= 1
-        print(f"[{self.device_name}] L4: ACKing seq={segment.seq}")
         self._send_ack(segment.seq, dst_ip, src_ip, segment.dst_port, segment.src_port)
 
     def _send_ack(self, seq: int, src_ip: str, dst_ip: str, src_port: int, dst_port: int) -> None:
@@ -493,20 +520,9 @@ class TransportLayer:
         """
         ack = Segment(src_port, dst_port, 10, 0, TYPE_ACK, seq, b"")
         ack.compute_checksum()
+        print(f"{self.device_name}: Layer 4: Segment created by adding transport layer header (ACK, seq={seq})")
+        print(f"{self.device_name}: Layer 4: Segment sent to Network Layer")
         self.network.send_down(ack, src_ip, dst_ip)
-
-    def _deliver(self, data: bytes) -> None:
-        """
-        Deliver verified application data to the local application.
-
-        Parameters
-        ----------
-        data : bytes
-            Payload extracted from a valid DATA segment.
-        """
-        preview = data[:40]
-        tail = "..." if len(data) > 40 else ""
-        print(f"[{self.device_name}] APP: received {len(data)} bytes: {preview!r}{tail}")
 
 
 class Host:
@@ -520,7 +536,7 @@ class Host:
     interface : Interface
         The single network interface owned by this host.
     arp_table : dict of str to str
-    routing_table : list of RouteEntry
+    routing_table : list of tuple
         Typically a single default route via the hosts gateway.
 
     Attributes
@@ -532,8 +548,8 @@ class Host:
     transport : TransportLayer
     """
 
-    def __init__(self, name: str, interface: Interface, arp_table: dict[str, str], routing_table: list[RouteEntry]):
-
+    def __init__(self, name: str, interface: Interface, arp_table: Dict[str, str],
+                 routing_table: List[Tuple[str, int, Optional[str], str]]):
         self.name = name
         self.interface = interface
         self.datalink = DataLinkLayer(name, [interface], arp_table)
@@ -576,7 +592,7 @@ class Router:
         All interfaces owned by this router.
     arp_table : dict of str to str
         Combined ARP table covering next hops on all interfaces.
-    routing_table : list of RouteEntry
+    routing_table : list of tuple
 
     Attributes
     ----------
@@ -586,13 +602,14 @@ class Router:
     network : NetworkLayer
     """
 
-    def __init__(self, name: str, interfaces: list[Interface], arp_table: dict[str, str], routing_table: list[RouteEntry]):
+    def __init__(self, name: str, interfaces: List[Interface], arp_table: Dict[str, str],
+                 routing_table: List[Tuple[str, int, Optional[str], str]]):
         self.name = name
         self.interfaces = interfaces
-        self.datalink = DataLinkLayer(name, interfaces, arp_table)
+        self.datalink = DataLinkLayer(name, interfaces, arp_table, is_router=True)
         self.network = NetworkLayer(name, interfaces, routing_table,
                                     is_router=True)
-        
+
         for iface in interfaces:
             iface.datalink = self.datalink
         self.datalink.network = self.network

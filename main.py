@@ -1,4 +1,5 @@
 import sys
+from typing import List, Tuple
 
 from config import (
     HOST_A_NAME, HOST_A_IFACE_NAME, HOST_A_IP, HOST_A_MAC,
@@ -13,7 +14,7 @@ from config import (
 from devices import Host, Router, Interface, Link
 
 
-def build_topology() -> tuple[Host, Router, Host]:
+def build_topology() -> Tuple[Host, Router, Host]:
     """
     Construct and wire up the simulator topology.
 
@@ -50,7 +51,7 @@ def build_topology() -> tuple[Host, Router, Host]:
     return host_a, router, host_b
 
 
-def parse_message_size(argv: list[str]) -> int:
+def parse_message_size(argv: List[str]) -> int:
     """
     Validate and parse the CLI message size argument.
 
@@ -83,7 +84,7 @@ def parse_message_size(argv: list[str]) -> int:
     return size
 
 
-def main(argv: list[str]) -> int:
+def main(argv: List[str]) -> int:
     """
     Build the topology and send a single message from Host A to Host B.
 
